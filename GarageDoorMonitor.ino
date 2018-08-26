@@ -1,15 +1,13 @@
 /*
-    Name:       GarageDoorMonitor.ino
-    Created:	8/25/2018 6:06:34 PM
-    Author:     Spencer Kittleson
+	Name:       GarageDoorMonitor.ino
+	Created:	8/25/2018 6:06:34 PM
+	Author:     Spencer Kittleson
 */
 
-// TODO close garage door if opened too long. buzzer.  pin is opened.
-// TODO led indicator whether door is opened or not
-// TODO open/close door and turn on/off light using relay
-// TODO non-blocking mqtt connection, reconnection, and loop
-// TODO proper mqtt messages
-// TODO 
+// DONE run without mqtt as well
+// TODO mqtt message on door,light open/close (optional)
+// TODO ArduinoJson is complaining about the latest version
+// TODO mqtt with user/password (optional)
 
 #include <FS.h>
 #include <ESP8266WiFi.h>          //ESP8266 Core WiFi Library (you most likely already have this in your sketch)
@@ -21,78 +19,112 @@
 
 WiFiClient wifiClient;
 PubSubClient mqttClient(wifiClient);
-char mqttServer[40];
 const int mqttPort = 1883;
-const int garageDoorRelayPin = 2;
-const int garageDoorReedSwitchPin = 4;
+const int garageDoorRelayPin = 1;
+const int garageDoorReedSwitchPin = 2;
 const int garageLightRelayPin = 3;
-const int garageDoorLedIndicatorPin = 5;
-const int garageDoorOverridePin = 6;
-const char* relayStatus = "status";
+const int garageDoorLedIndicatorPin = 4;
+const int garageDoorOverridePin = 5;
+const int garageDoorMaxOpenMins = 15;
 const char* relayOn = "true";
 const char* relayOff = "false";
-const char* topic = "home/garage-door";
-const char* topicEvent = "home/garage-door/event";
-bool shouldSaveConfig = false;
+const char* topicGarageOpener = "home/garage/opener";
+const char* topicGarageOpenerLight = "home/garage/opener/light";
+const char* topicGarageOpenerDoor = "home/garage/opener/door";
+const char* topicGarageOpenerStatus = "home/garage/opener/status";
 
-/**
-* Convert byte array into char array.
-*/
-char* byteArrayIntoCharArray(byte* bytes, unsigned int length) {
-	char* data = (char*)bytes;
-	data[length] = NULL;
-	return data;
+long garageOpenedAt = 0;
+bool shouldSaveConfig = false;
+char mqttServer[40];
+bool isMqtt = false;
+long mqttLastReconnectAttempt = 0;
+
+void setup() {
+	Serial.begin(115200);
+
+	//Default the primary relay off
+	pinMode(garageDoorRelayPin, OUTPUT);
+	pinMode(garageDoorReedSwitchPin, INPUT);
+	pinMode(garageDoorLedIndicatorPin, OUTPUT);
+	digitalWrite(garageDoorRelayPin, 1);
+	delay(500);
+	setupWifi();
+	if (isMqtt) {
+		mqttClient.setServer(mqttServer, mqttPort);
+		mqttClient.setCallback(callbackMessage);
+	}
 }
 
-
-/**
-* Callback handler for MQTT
-*/
-void callbackMessage(char* incomingTopic, byte* payload, unsigned int length) {
-	//Only topic defined should be processed
-	//if (strcmp(incomingTopic, topic) != 0) { return; }
-	int pinToFire = 0;
-	if (strcmp(incomingTopic, "light") == 0) {
-		pinToFire = garageLightRelayPin;
-	} else if (strcmp(incomingTopic, "garage-door") == 0) {
-		pinToFire = garageDoorRelayPin;
-	} else if (strcmp(incomingTopic, "alarm") == 0) {
-	 pinToFire = garageDoorRelayPin;
- }
-
-	char* payloadValue = byteArrayIntoCharArray(payload, length);
-
-	//Allocate for json response
-	DynamicJsonBuffer jsonBuffer;
-	JsonObject& root = jsonBuffer.createObject();
-	root["event"] = "relay";
-	root["topic"] = topic;
-	root["msg"] = "";
-	root["uptime"] = millis();
-
-	
-	
-
-
-	if (strcmp(payloadValue, relayStatus) == 0) {
-		root[relayStatus] = !((bool)digitalRead(garageDoorRelayPin));
+void loop() {
+	if (isMqtt) {
+		mqttLoop();
 	}
-	else if (strcmp(payloadValue, relayOn) == 0) {
-		digitalWrite(garageDoorRelayPin, 0);
-		root[relayStatus] = true;
-	}
-	else if (strcmp(payloadValue, relayOff) == 0) {
-		digitalWrite(garageDoorRelayPin, 1);
-		root[relayStatus] = false;
+	isGarageDoorOpened();
+	delay(1);
+}
+
+void isGarageDoorOpened() {
+	if (digitalRead(garageDoorReedSwitchPin) == HIGH) {
+		digitalWrite(garageDoorLedIndicatorPin, LOW);
+		garageOpenedAt = 0;
 	}
 	else {
-		root["msg"] = "unknown payload";
+		digitalWrite(garageDoorLedIndicatorPin, HIGH);
+
+		// Physical override if the door is to remain open for longer
+		if (digitalRead(garageDoorOverridePin) == HIGH) {
+			// Blink a bunch of times to let someone know to flip the switch back
+			for (int i = 0; i <= 5; i++) {
+				digitalWrite(garageDoorLedIndicatorPin, LOW);
+				delay(2000);
+				digitalWrite(garageDoorLedIndicatorPin, HIGH);
+			}
+		}
+		else {
+			// If the garage door has been opened for X amount minutes then close the door and reset the clock
+			long now = millis();
+			long maxOpenMillis = (garageDoorMaxOpenMins * 60 * 1000);
+			if (now - garageOpenedAt > maxOpenMillis) {
+				garageOpenedAt = 0;
+				RelaySimulateButtonPress(garageDoorRelayPin);
+				if (isMqtt) {
+
+				}
+			}
+		}
 	}
-	String payloadJson;
-	root.printTo(payloadJson);
-	Serial.println(payloadJson);
-	mqttClient.publish(topicEvent, payloadJson.c_str());
 }
+
+/*
+Setup access point and special configurations
+*/
+void setupWifi() {
+	SPIFFS.begin();
+	WiFiManager wifiManager;
+	wifiManager.setSaveConfigCallback([]() { shouldSaveConfig = true; });
+	//wifiManager.resetSettings();
+	WiFiManagerParameter custom_mqtt_server("server", "mqtt server", mqttServer, 40);
+	wifiManager.addParameter(&custom_mqtt_server);
+	wifiManager.autoConnect("GarageDoorMonitorAp");
+
+	//save the custom parameters to FS
+	if (shouldSaveConfig) {
+		strcpy(mqttServer, custom_mqtt_server.getValue());
+		String mqttServerStr(mqttServer);
+		isMqtt = (mqttServerStr.length() > 0);
+		saveConfig();
+	}
+	loadConfig();
+	Serial.print("Connected to ");
+	Serial.println(WiFi.SSID());
+	Serial.print("IP address:\t");
+	Serial.println(WiFi.localIP());
+	Serial.print("Is Mqtt?:\t");
+	Serial.println(isMqtt);
+	SPIFFS.end();
+}
+
+#pragma region Config Methods
 
 /**
 * Save values that need to persist a reboot
@@ -143,66 +175,95 @@ bool saveConfig() {
 	json.printTo(configFile);
 	return true;
 }
+#pragma endregion
+
+#pragma region Mqtt
 
 /**
-* Reconnect mqtt client
+* Convert byte array into char array.
 */
-void reconnect() {
-	while (!mqttClient.connected()) {
-		Serial.print("Attempting MQTT connection...");
-		if (mqttClient.connect("IoT Client")) {
-			Serial.println("connected");
-			mqttClient.subscribe(topic);
-		}
-		else {
-			Serial.print("failed, rc=");
-			Serial.print(mqttClient.state());
-			Serial.println(" try again in 5 seconds");
-			delay(5 * 1000);
-		}
+char* byteArrayIntoCharArray(byte* bytes, unsigned int length) {
+	char* data = (char*)bytes;
+	data[length] = NULL;
+	return data;
+}
+
+/**
+* Callback handler for MQTT
+*/
+void callbackMessage(char* incomingTopic, byte* payload, unsigned int length) {
+	//Only topic defined should be processed
+	int pinMapping = 0;
+	if (strcmp(incomingTopic, topicGarageOpenerLight) == 0) {
+		pinMapping = garageLightRelayPin;
 	}
-}
-
-void isGarageDoorOpened() {
-	// is it opened?
-	// 
-
-}
-
-void setup() {
-	Serial.begin(115200);
-	SPIFFS.begin();
-
-	//Default the primary relay off
-	pinMode(garageDoorRelayPin, OUTPUT);
-	pinMode(garageDoorReedSwitchPin, INPUT);
-	digitalWrite(garageDoorRelayPin, 1);
-	delay(500);
-	WiFiManager wifiManager;
-	wifiManager.setSaveConfigCallback( []() { shouldSaveConfig = true;  });
-	//wifiManager.resetSettings();
-	WiFiManagerParameter custom_mqtt_server("server", "mqtt server", mqttServer, 40);
-	wifiManager.addParameter(&custom_mqtt_server);
-	wifiManager.autoConnect("GarageDoorMonitorAp");
-
-	//save the custom parameters to FS
-	if (shouldSaveConfig) {
-		strcpy(mqttServer, custom_mqtt_server.getValue());
-		saveConfig();
+	else if (strcmp(incomingTopic, topicGarageOpenerDoor) == 0) {
+		pinMapping = garageDoorRelayPin;
 	}
-	loadConfig();
-	mqttClient.setServer(mqttServer, mqttPort);
-	mqttClient.setCallback(callbackMessage);
-	Serial.println("Connected");
-	SPIFFS.end();
+	else {
+		return;
+	}
+
+	char* payloadValue = byteArrayIntoCharArray(payload, length);
+
+	StaticJsonBuffer<400> jsonBuffer;
+	JsonObject& root = jsonBuffer.createObject();
+	root["topic"] = incomingTopic;
+	root["msg"] = "";
+	root["uptime"] = millis();
+
+	// Simulate a button press using a relay
+	if (strcmp(payloadValue, relayOn) == 0) {
+		RelaySimulateButtonPress(pinMapping);
+	}
+	else if (strcmp(payloadValue, relayOff) == 0) {
+		digitalWrite(pinMapping, 1);
+	}
+	else {
+		root["msg"] = "unknown payload";
+	}
+	String payloadJson;
+	root.printTo(payloadJson);
+	Serial.println(payloadJson);
+	mqttClient.publish(topicGarageOpenerStatus, payloadJson.c_str());
 }
 
-void loop() {
+boolean mqttReconnect() {
+	if (mqttClient.connect("GarageDoorOpener")) {
+		StaticJsonBuffer<400> jsonBuffer;
+		JsonObject& root = jsonBuffer.createObject();
+		root["connected"] = true;
+		root["wifi-ssid"] = WiFi.SSID();
+		root["ip-address"] = WiFi.localIP();
+		String payloadJson;
+		root.printTo(payloadJson);
+		mqttClient.publish(topicGarageOpener, payloadJson.c_str());
+		mqttClient.subscribe(topicGarageOpenerLight);
+		mqttClient.subscribe(topicGarageOpenerDoor);
+	}
+	return mqttClient.connected();
+}
+
+void mqttLoop()
+{
 	if (!mqttClient.connected()) {
-		reconnect();
+		long now = millis();
+		if (now - mqttLastReconnectAttempt > 5000) {
+			mqttLastReconnectAttempt = now;
+			// Attempt to reconnect
+			if (mqttReconnect()) {
+				mqttLastReconnectAttempt = 0;
+			}
+		}
 	}
-	mqttClient.loop();
+	else {
+		mqttClient.loop();
+	}
+}
+#pragma endregion
 
-	// check pin
-	
+void RelaySimulateButtonPress(int pin) {
+	digitalWrite(pin, 0);
+	delay(500);
+	digitalWrite(pin, 1);
 }
